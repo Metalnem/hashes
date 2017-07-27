@@ -58,6 +58,8 @@ func computeHash(ctx context.Context, path string) (string, error) {
 }
 
 func create(ctx context.Context, dirs []string) error {
+	// check for existing database before creating
+
 	name := fmt.Sprintf("%d.hashes", time.Now().Unix())
 	db, err := sql.Open("sqlite3", name)
 
@@ -92,6 +94,8 @@ func create(ctx context.Context, dirs []string) error {
 			if err != nil {
 				return err
 			}
+
+			// return processed file using channel
 
 			fmt.Printf("%s %s\n", h, path)
 
