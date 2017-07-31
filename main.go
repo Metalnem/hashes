@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/metalnem/dropbox/hash"
@@ -26,7 +29,7 @@ type fileInfo struct {
 	err  error
 }
 
-func computeHash(path string) (string, error) {
+func computeHash(ctx context.Context, path string) (string, error) {
 	f, err := os.Open(path)
 
 	if err != nil {
@@ -56,7 +59,7 @@ func computeHash(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func computeHashes(dirs []string) <-chan fileInfo {
+func computeHashes(ctx context.Context, dirs []string) <-chan fileInfo {
 	ch := make(chan fileInfo)
 
 	go func() {
@@ -76,7 +79,7 @@ func computeHashes(dirs []string) <-chan fileInfo {
 					return nil
 				}
 
-				hash, err := computeHash(path)
+				hash, err := computeHash(ctx, path)
 
 				if err != nil {
 					return err
@@ -98,14 +101,60 @@ func computeHashes(dirs []string) <-chan fileInfo {
 	return ch
 }
 
-func main() {
-	dirs := os.Args[1:]
+func createDb(ctx context.Context, files map[string]string) error {
+	name := fmt.Sprintf("%d.hashes", time.Now().Unix())
+	db, err := sql.Open("sqlite3", name)
 
-	for file := range computeHashes(dirs) {
+	if err != nil {
+		return errors.Wrapf(err, "failed to create database file %s", name)
+	}
+
+	defer db.Close()
+
+	if _, err = db.ExecContext(ctx, schema); err != nil {
+		return errors.Wrap(err, "failed to initialize database")
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+
+	if err != nil {
+		return errors.Wrap(err, "failed to start transaction")
+	}
+
+	stmt, err := tx.PrepareContext(ctx, "insert into files(path, hash) values(?, ?)")
+
+	if err != nil {
+		tx.Rollback()
+		return errors.Wrap(err, "failed to prepare insert statement")
+	}
+
+	defer stmt.Close()
+
+	for path, hash := range files {
+		if _, err := stmt.ExecContext(ctx, path, hash); err != nil {
+			tx.Rollback()
+			return errors.Wrapf(err, "failed to insert hash for %s", path)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func main() {
+	ctx := context.Background()
+	dirs := os.Args[1:]
+	files := make(map[string]string)
+
+	for file := range computeHashes(ctx, dirs) {
 		if file.err != nil {
 			log.Fatal(file.err)
 		}
 
 		fmt.Println(file.path)
+		files[file.path] = file.hash
+	}
+
+	if err := createDb(ctx, files); err != nil {
+		log.Fatal(err)
 	}
 }
