@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,8 +17,9 @@ import (
 	"github.com/metalnem/dropbox/hash"
 )
 
-const usage = `usage: hashes create dir1 dir2 ...
-       hashes verify file1 file2`
+const usage = `Usage of hashes:
+  hashes create dir1 dir2 ...
+  hashes diff file1 file2`
 
 const schema = `create table files (
 	path text not null primary key,
@@ -26,15 +28,10 @@ const schema = `create table files (
 
 var buffer = make([]byte, hash.BlockSize)
 
-type fileInfo struct {
+type file struct {
 	path string
 	hash string
 	err  error
-}
-
-type database struct {
-	time   int64
-	byHash map[string][]string
 }
 
 func computeHash(ctx context.Context, path string) (string, error) {
@@ -67,8 +64,8 @@ func computeHash(ctx context.Context, path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func computeHashes(ctx context.Context, dirs []string) <-chan fileInfo {
-	ch := make(chan fileInfo)
+func computeHashes(ctx context.Context, dirs []string) <-chan file {
+	ch := make(chan file)
 
 	go func() {
 		for _, dir := range dirs {
@@ -93,13 +90,13 @@ func computeHashes(ctx context.Context, dirs []string) <-chan fileInfo {
 					return err
 				}
 
-				ch <- fileInfo{path: path, hash: hash}
+				ch <- file{path: path, hash: hash}
 
 				return nil
 			})
 
 			if err != nil {
-				ch <- fileInfo{err: err}
+				ch <- file{err: err}
 			}
 		}
 
@@ -109,7 +106,7 @@ func computeHashes(ctx context.Context, dirs []string) <-chan fileInfo {
 	return ch
 }
 
-func createDb(ctx context.Context, files []fileInfo) error {
+func createDb(ctx context.Context, files []file) error {
 	name := fmt.Sprintf("%d.hashes", time.Now().Unix())
 	db, err := sql.Open("sqlite3", name)
 
@@ -138,8 +135,8 @@ func createDb(ctx context.Context, files []fileInfo) error {
 
 	defer stmt.Close()
 
-	for path, hash := range files {
-		if _, err := stmt.ExecContext(ctx, path, hash); err != nil {
+	for _, file := range files {
+		if _, err := stmt.ExecContext(ctx, file.path, file.hash); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -148,7 +145,7 @@ func createDb(ctx context.Context, files []fileInfo) error {
 	return tx.Commit()
 }
 
-func loadDb(ctx context.Context, path string) ([]fileInfo, error) {
+func loadDb(ctx context.Context, path string) (map[string][]string, error) {
 	db, err := sql.Open("sqlite3", path)
 
 	if err != nil {
@@ -165,7 +162,7 @@ func loadDb(ctx context.Context, path string) ([]fileInfo, error) {
 
 	defer rows.Close()
 
-	var files []fileInfo
+	files := make(map[string][]string)
 
 	for rows.Next() {
 		var path, hash string
@@ -174,7 +171,7 @@ func loadDb(ctx context.Context, path string) ([]fileInfo, error) {
 			return nil, err
 		}
 
-		files = append(files, fileInfo{path: path, hash: hash})
+		files[hash] = append(files[hash], path)
 	}
 
 	if err := rows.Err(); err != nil {
@@ -184,30 +181,22 @@ func loadDb(ctx context.Context, path string) ([]fileInfo, error) {
 	return files, nil
 }
 
-func loadFile(ctx context.Context, path string) (*database, error) {
-	var time int64
+func missing(files1, files2 map[string][]string) []string {
+	var res []string
 
-	if _, err := fmt.Sscanf(filepath.Base(path), "%d.hashes", &time); err != nil {
-		return nil, err
+	for hash, paths := range files1 {
+		if _, ok := files2[hash]; !ok {
+			res = append(res, paths...)
+		}
 	}
 
-	files, err := loadDb(ctx, path)
+	sort.Strings(res)
 
-	if err != nil {
-		return nil, err
-	}
-
-	byHash := make(map[string][]string)
-
-	for _, file := range files {
-		byHash[file.hash] = append(byHash[file.hash], file.path)
-	}
-
-	return &database{time: time, byHash: byHash}, nil
+	return res
 }
 
 func create(ctx context.Context, dirs []string) error {
-	var files []fileInfo
+	var files []file
 
 	for file := range computeHashes(ctx, dirs) {
 		if file.err != nil {
@@ -221,29 +210,25 @@ func create(ctx context.Context, dirs []string) error {
 	return createDb(ctx, files)
 }
 
-func verify(ctx context.Context, file1, file2 string) error {
-	db1, err := loadFile(ctx, file1)
+func diff(ctx context.Context, file1, file2 string) error {
+	files1, err := loadDb(ctx, file1)
 
 	if err != nil {
 		return err
 	}
 
-	db2, err := loadFile(ctx, file2)
+	files2, err := loadDb(ctx, file2)
 
 	if err != nil {
 		return err
 	}
 
-	if db1.time > db2.time {
-		db1, db2 = db2, db1
+	for _, path := range missing(files1, files2) {
+		fmt.Printf("- %s\n", path)
 	}
 
-	for hash, paths := range db1.byHash {
-		if _, ok := db2.byHash[hash]; !ok {
-			for _, path := range paths {
-				fmt.Println(path)
-			}
-		}
+	for _, path := range missing(files2, files1) {
+		fmt.Printf("+ %s\n", path)
 	}
 
 	return nil
@@ -263,8 +248,8 @@ func main() {
 		if err := create(ctx, params); err != nil {
 			log.Fatal(err)
 		}
-	} else if action == "verify" && len(params) == 2 {
-		if err := verify(ctx, params[0], params[1]); err != nil {
+	} else if action == "diff" && len(params) == 2 {
+		if err := diff(ctx, params[0], params[1]); err != nil {
 			log.Fatal(err)
 		}
 	} else {
