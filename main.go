@@ -46,6 +46,10 @@ func computeHash(ctx context.Context, path string) (string, error) {
 	h := hash.New()
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+
 		n, err := f.Read(buffer)
 
 		if n > 0 {
